@@ -5,15 +5,8 @@ This code has been generalized from a specific implementation to serve as
 a template for various protein structure diffusion tasks. You will need to adapt 
 this template to your specific use case by:
 
-1. Updating dataset import and data paths
-2. Modifying the validation and training logic for your protein system
-3. Adjusting model configurations for your specific architecture
-4. Customizing loss functions and evaluation metrics
-5. Updating project names and logging configurations
-
 All areas requiring customization are marked with TODO comments throughout the code.
 
-Generalized by: [Hussein Al-Asadi/Adaptive Biotechnologies] 
 """
 
 import datetime
