@@ -31,7 +31,7 @@ Used this protocol to fine-tune RFDiffusion for TCR-pMHC complex generation. Sho
 
 **Generalized Templates:** I removed TCR/peptide/MHC specific parts and sketched out generalized code for dataloaders that I have not tested. You'll need to adapt them for your protein system.
 
-**Compute Enviornment** You will need to adapt the code to suit your compute enviornment, i.e. GPU/Data/Pixi enviornment.
+**Compute Enviornment** You will need to adapt the code to suit your compute enviornment.
 
 ## Files
 
@@ -54,6 +54,7 @@ Require customization for your specific use case
    - Update storage paths and authentication
    - Adjust GPU counts and memory settings
    - Set WandB project name and entity
+   - Configure DockerFile + pyproject.toml for your enviornment
 
 3. **Launch training:**
    ```bash
