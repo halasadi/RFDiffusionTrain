@@ -27,38 +27,36 @@ Used this protocol to fine-tune RFDiffusion for TCR-pMHC complex generation. Sho
 
 ## Key Implementation Notes
 
-**Losses:** There are two major losses in RFDiffusion: dFrame and L2D. Followed the supplementary section in coming the dFrame Loss. While for the L2D loss, the supplement seemed to be in-consistent in binning strategy compared to the code (see PARAMS variable), so I followed the original RosettaFold2 repo implementation instead.
+**Losses:** RFDiffusion employs two primary loss functions: dFrame and L2D. The dFrame loss was implemented following the methodology described in the supplementary materials. For the L2D loss, inconsistencies were found between the binning strategy outlined in the supplement and the actual code implementation (specifically in the PARAMS variable). To resolve this discrepancy, I opted to follow the implementation from the original RosettaFold2 repository, though this choice may introduce potential inaccuracies given the conflicting documentation.
 
 **Generalized Templates:** I removed TCR/peptide/MHC specific parts and sketched out generalized code for dataloaders that I have not tested. You'll need to adapt them for your protein system.
 
-**Compute Enviornment** You will need to adapt the code to suit your compute enviornment.
+**Compute Enviornment** This implementation will not build out of the box and requires adaptation to your specific computing environment.
 
 ## Files
 
 Require customization for your specific use case
 - `dataset.py` - Generalized protein dataset template
-- `training_script.py` - Main training pipeline template
+- `workflows/train_rfdiffusion.py` - Main training pipeline template
 - `test_diffusion.py` - Runner script
 
 
 - `custom` - includes the custom losses and utils
 
-## Where to Start
+## A place to Start
 
 1. **Customize the templates:**
-   - Update metadata column names in `dataset.py`
-   - Define your protein regions and diffusion strategy
-   - Modify paths and project settings in `training_script.py`
+   Update `dataset.py` and `workflows/train_rfdiffusion.py` to suit your custom problem
+   - E.g. Define your protein regions and diffusion strategy. Modify paths and project settings in `training_script.py`
 
 2. **Configure for your cluster:**
+   - Configure DockerFile + pyproject.toml + pixi enviornment
    - Update storage paths and authentication
-   - Adjust GPU counts and memory settings
-   - Set WandB project name and entity
-   - Configure DockerFile + pyproject.toml for your enviornment
+   - Set-up WandB if desired.
 
-3. **Launch training:**
+4. **Launch training:**
    ```bash
-   python training_script.py
+   python workflows/train_rfdiffusion.py
    ```
 
 ## Requirements
