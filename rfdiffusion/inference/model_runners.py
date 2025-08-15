@@ -10,7 +10,9 @@ from rfdiffusion.contigs import ContigMap
 from rfdiffusion.inference import utils as iu, symmetry
 from rfdiffusion.potentials.manager import PotentialManager
 import logging
-import torch.nn.functional as nn
+#import torch.nn.functional as nn
+import torch.nn.functional as F
+
 from rfdiffusion import util
 from hydra.core.hydra_config import HydraConfig
 import os
@@ -25,7 +27,7 @@ TOR_CAN_FLIP = util.torsion_can_flip
 REF_ANGLES   = util.reference_angles
 
 
-class Sampler:
+class Sampler():
 
     def __init__(self, conf: DictConfig):
         """
@@ -33,8 +35,33 @@ class Sampler:
         Args:
             conf: Configuration.
         """
+        super().__init__()
+
         self.initialized = False
         self.initialize(conf)
+
+
+    def save_model(self, model_name: str):
+        """Save the trained RosettaFold model to a checkpoint file."""
+    
+        if not model_name.endswith(".pt"):
+            model_name += ".pt"  # Ensure proper file extension
+    
+        save_path = f"{SCRIPT_DIR}/../../models/{model_name}"
+    
+        # Move model to CPU before saving to avoid CUDA dependencies
+        model = self.model.to('cpu')
+    
+        checkpoint = {
+            'model_state_dict': model.state_dict(),  # Save model weights
+            'config': self._conf,  # Save configuration for reproducibility
+        }
+    
+        torch.save(checkpoint, save_path)
+    
+        print(f'Model successfully saved at {save_path}')
+
+
         
     def initialize(self, conf: DictConfig) -> None:
         """
@@ -47,120 +74,34 @@ class Sampler:
 
         """
         self._log = logging.getLogger(__name__)
+
         if torch.cuda.is_available():
             self.device = torch.device('cuda')
+            print("Using GPU for inference")
         else:
             self.device = torch.device('cpu')
-        needs_model_reload = not self.initialized or conf.inference.ckpt_override_path != self._conf.inference.ckpt_override_path
-
+            print("Using CPU for inference")
+    
         # Assign config to Sampler
-        self._conf = conf
+        self._conf = conf 
 
-        ################################
-        ### Select Appropriate Model ###
-        ################################
-
-        if conf.inference.model_directory_path is not None:
-            model_directory = conf.inference.model_directory_path
-        else:
-            model_directory = f"{SCRIPT_DIR}/../../models"
+        model_directory = f"{SCRIPT_DIR}/../../models"
 
         print(f"Reading models from {model_directory}")
 
-        # Initialize inference only helper objects to Sampler
-        if conf.inference.ckpt_override_path is not None:
-            self.ckpt_path = conf.inference.ckpt_override_path
-            print("WARNING: You're overriding the checkpoint path from the defaults. Check that the model you're providing can run with the inputs you're providing.")
-        else:
-            if conf.contigmap.inpaint_seq is not None or conf.contigmap.provide_seq is not None or conf.contigmap.inpaint_str:
-                # use model trained for inpaint_seq
-                if conf.contigmap.provide_seq is not None:
-                    # this is only used for partial diffusion
-                    assert conf.diffuser.partial_T is not None, "The provide_seq input is specifically for partial diffusion"
-                if conf.scaffoldguided.scaffoldguided:
-                    self.ckpt_path = f'{model_directory}/InpaintSeq_Fold_ckpt.pt'
-                else:
-                    self.ckpt_path = f'{model_directory}/InpaintSeq_ckpt.pt'
-            elif conf.ppi.hotspot_res is not None and conf.scaffoldguided.scaffoldguided is False:
-                # use complex trained model
-                self.ckpt_path = f'{model_directory}/Complex_base_ckpt.pt'
-            elif conf.scaffoldguided.scaffoldguided is True:
-                # use complex and secondary structure-guided model
-                self.ckpt_path = f'{model_directory}/Complex_Fold_base_ckpt.pt'
-            else:
-                # use default model
-                self.ckpt_path = f'{model_directory}/Base_ckpt.pt'
-        # for saving in trb file:
-        assert self._conf.inference.trb_save_ckpt_path is None, "trb_save_ckpt_path is not the place to specify an input model. Specify in inference.ckpt_override_path"
-        self._conf['inference']['trb_save_ckpt_path']=self.ckpt_path
+        self.ckpt_path = f'{model_directory}/{conf.model_name}.pt'
 
-        #######################
-        ### Assemble Config ###
-        #######################
+        self.load_checkpoint()
+        self.assemble_config_from_chk()
+        # Now actually load the model weights into RF
+        self.model = self.load_model()
 
-        if needs_model_reload:
-            # Load checkpoint, so that we can assemble the config
-            self.load_checkpoint()
-            self.assemble_config_from_chk()
-            # Now actually load the model weights into RF
-            self.model = self.load_model()
-        else:
-            self.assemble_config_from_chk()
-
-        # self.initialize_sampler(conf)
         self.initialized=True
 
-        # Initialize helper objects
-        self.inf_conf = self._conf.inference
-        self.contig_conf = self._conf.contigmap
-        self.denoiser_conf = self._conf.denoiser
-        self.ppi_conf = self._conf.ppi
-        self.potential_conf = self._conf.potentials
         self.diffuser_conf = self._conf.diffuser
-        self.preprocess_conf = self._conf.preprocess
-
-        if conf.inference.schedule_directory_path is not None:
-            schedule_directory = conf.inference.schedule_directory_path
-        else:
-            schedule_directory = f"{SCRIPT_DIR}/../../schedules"
-
-        # Check for cache schedule
-        if not os.path.exists(schedule_directory):
-            os.mkdir(schedule_directory)
-        self.diffuser = Diffuser(**self._conf.diffuser, cache_dir=schedule_directory)
-
-        ###########################
-        ### Initialise Symmetry ###
-        ###########################
-
-        if self.inf_conf.symmetry is not None:
-            self.symmetry = symmetry.SymGen(
-                self.inf_conf.symmetry,
-                self.inf_conf.recenter,
-                self.inf_conf.radius,
-                self.inf_conf.model_only_neighbors,
-            )
-        else:
-            self.symmetry = None
-
         self.allatom = ComputeAllAtomCoords().to(self.device)
+
         
-        if self.inf_conf.input_pdb is None:
-            # set default pdb
-            script_dir=os.path.dirname(os.path.realpath(__file__))
-            self.inf_conf.input_pdb=os.path.join(script_dir, '../../examples/input_pdbs/1qys.pdb')
-        self.target_feats = iu.process_target(self.inf_conf.input_pdb, parse_hetatom=True, center=False)
-        self.chain_idx = None
-
-        ##############################
-        ### Handle Partial Noising ###
-        ##############################
-
-        if self.diffuser_conf.partial_T:
-            assert self.diffuser_conf.partial_T <= self.diffuser_conf.T
-            self.t_step_input = int(self.diffuser_conf.partial_T)
-        else:
-            self.t_step_input = int(self.diffuser_conf.T)
         
     @property
     def T(self):
@@ -178,8 +119,10 @@ class Sampler:
         self._log.info(f'Reading checkpoint from {self.ckpt_path}')
         print('This is inf_conf.ckpt_path')
         print(self.ckpt_path)
+        # comment out for PyTorch lightning
         self.ckpt  = torch.load(
             self.ckpt_path, map_location=self.device)
+        #self.ckpt  = torch.load(self.ckpt_path, map_location='cpu')
 
     def assemble_config_from_chk(self) -> None:
         """
@@ -223,10 +166,14 @@ class Sampler:
         # Read input dimensions from checkpoint.
         self.d_t1d=self._conf.preprocess.d_t1d
         self.d_t2d=self._conf.preprocess.d_t2d
+
+        # don't need to the .to(self.device) because of pytorch lightning
         model = RoseTTAFoldModule(**self._conf.model, d_t1d=self.d_t1d, d_t2d=self.d_t2d, T=self._conf.diffuser.T).to(self.device)
         if self._conf.logging.inputs:
             pickle_dir = pickle_function_call(model, 'forward', 'inference')
             print(f'pickle_dir: {pickle_dir}')
+        
+        # don't need this because of pytorch lightning 
         model = model.eval()
         self._log.info(f'Loading checkpoint.')
         model.load_state_dict(self.ckpt['model_state_dict'], strict=True)
@@ -278,29 +225,7 @@ class Sampler:
         self.mappings = self.contig_map.get_mappings()
         self.mask_seq = torch.from_numpy(self.contig_map.inpaint_seq)[None,:]
         self.mask_str = torch.from_numpy(self.contig_map.inpaint_str)[None,:]
-        self.binderlen =  len(self.contig_map.inpaint)    
-        
-        #######################################
-        ### Resolve cyclic peptide indicies ###
-        #######################################
-        if self._conf.inference.cyclic:
-            if self._conf.inference.cyc_chains is None:
-                # default to all residues being cyclized
-                self.cyclic_reses = ~self.mask_str.to(self.device).squeeze()
-            else:
-                # use cyc_chains arg to determine cyclic_reses mask
-                assert type(self._conf.inference.cyc_chains) is str, 'cyc_chains arg must be string'
-                cyc_chains  = self._conf.inference.cyc_chains
-                cyc_chains  = [i.upper() for i in cyc_chains]
-                hal_idx     = self.contig_map.hal # the pdb indices of output, knowledge of different chains
-                is_cyclized = torch.zeros_like(self.mask_str).bool().to(self.device).squeeze() # initially empty
-
-                for ch in cyc_chains:
-                    ch_mask = torch.tensor([idx[0] == ch for idx in hal_idx]).bool()
-                    is_cyclized[ch_mask] = True # set this whole chain to be cyclic
-                self.cyclic_reses = is_cyclized
-        else:
-            self.cyclic_reses = torch.zeros_like(self.mask_str).bool().to(self.device).squeeze()
+        self.binderlen =  len(self.contig_map.inpaint)     
 
         ####################
         ### Get Hotspots ###
@@ -394,12 +319,7 @@ class Sampler:
 
         self.denoiser = self.construct_denoiser(len(self.contig_map.ref), visible=self.mask_seq.squeeze())
 
-        ######################
-        ### Apply Symmetry ###
-        ######################
 
-        if self.symmetry is not None:
-            xt, seq_t = self.symmetry.apply_symmetry(xt, seq_t)
         self._log.info(f'Sequence init: {seq2chars(torch.argmax(seq_t, dim=-1))}')
         
         self.msa_prev = None
@@ -428,7 +348,7 @@ class Sampler:
                     pot.diffuser = self.diffuser
         return xt, seq_t
 
-    def _preprocess(self, seq, xyz_t, t, repack=False):
+    def _preprocess(self, seq, xyz_t, t, binderlen, hotspot_res, mask_str, sidechain_input, rf, d_t1d, con_ref_pdb_idx, hal_idx0, repack=False):
         
         """
         Function to prepare inputs to diffusion model
@@ -454,11 +374,8 @@ class Sampler:
                 - last plane is block adjacency
     """
 
-        L = seq.shape[0]
-        T = self.T
-        binderlen = self.binderlen
-        target_res = self.ppi_conf.hotspot_res
-
+        L = seq.shape[0]        
+        
         ##################
         ### msa_masked ###
         ##################
@@ -494,8 +411,8 @@ class Sampler:
 
         # Set timestep feature to 1 where diffusion mask is True, else 1-t/T
         timefeature = torch.zeros((L)).float()
-        timefeature[self.mask_str.squeeze()] = 1
-        timefeature[~self.mask_str.squeeze()] = 1 - t/self.T
+        timefeature[mask_str.squeeze()] = 1
+        timefeature[~mask_str.squeeze()] = 1 - t/self.T
         timefeature = timefeature[None,None,...,None]
 
         t1d = torch.cat((t1d, timefeature), dim=-1).float()
@@ -503,10 +420,10 @@ class Sampler:
         #############
         ### xyz_t ###
         #############
-        if self.preprocess_conf.sidechain_input:
+        if sidechain_input:
             xyz_t[torch.where(seq == 21, True, False),3:,:] = float('nan')
         else:
-            xyz_t[~self.mask_str.squeeze(),3:,:] = float('nan')
+            xyz_t[~mask_str.squeeze(),3:,:] = float('nan')
 
         xyz_t=xyz_t[None, None]
         xyz_t = torch.cat((xyz_t, torch.full((1,1,L,13,3), float('nan'))), dim=3)
@@ -519,7 +436,8 @@ class Sampler:
         ###########      
         ### idx ###
         ###########
-        idx = torch.tensor(self.contig_map.rf)[None]
+        idx = torch.tensor(rf)[None]
+        #idx = torch.tensor(args['contig_map'].rf)[None]
 
         ###############
         ### alpha_t ###
@@ -544,19 +462,20 @@ class Sampler:
         
         ######################
         ### added_features ###
-        ######################
-        if self.preprocess_conf.d_t1d >= 24: # add hotspot residues
+        ######################        
+        if d_t1d >= 24: # add hotspot residues
             hotspot_tens = torch.zeros(L).float()
-            if self.ppi_conf.hotspot_res is None:
+            if len(hotspot_res) == 0:
                 print("WARNING: you're using a model trained on complexes and hotspot residues, without specifying hotspots.\
                          If you're doing monomer diffusion this is fine")
                 hotspot_idx=[]
             else:
-                hotspots = [(i[0],int(i[1:])) for i in self.ppi_conf.hotspot_res]
+                hotspots = [(i[0],int(i[1:])) for i in hotspot_res]
                 hotspot_idx=[]
-                for i,res in enumerate(self.contig_map.con_ref_pdb_idx):
+                for i,res in enumerate(con_ref_pdb_idx):
                     if res in hotspots:
-                        hotspot_idx.append(self.contig_map.hal_idx0[i])
+                        #hotspot_idx.append(args['contig_map'].hal_idx0[i])
+                        hotspot_idx.append(hal_idx0[i])
                 hotspot_tens[hotspot_idx] = 1.0
 
             # Add blank (legacy) feature and hotspot tensor
@@ -564,78 +483,6 @@ class Sampler:
 
         return msa_masked, msa_full, seq[None], torch.squeeze(xyz_t, dim=0), idx, t1d, t2d, xyz_t, alpha_t
         
-    def sample_step(self, *, t, x_t, seq_init, final_step):
-        '''Generate the next pose that the model should be supplied at timestep t-1.
-
-        Args:
-            t (int): The timestep that has just been predicted
-            seq_t (torch.tensor): (L,22) The sequence at the beginning of this timestep
-            x_t (torch.tensor): (L,14,3) The residue positions at the beginning of this timestep
-            seq_init (torch.tensor): (L,22) The initialized sequence used in updating the sequence.
-            
-        Returns:
-            px0: (L,14,3) The model's prediction of x0.
-            x_t_1: (L,14,3) The updated positions of the next step.
-            seq_t_1: (L,22) The updated sequence of the next step.
-            tors_t_1: (L, ?) The updated torsion angles of the next  step.
-            plddt: (L, 1) Predicted lDDT of x0.
-        '''
-        msa_masked, msa_full, seq_in, xt_in, idx_pdb, t1d, t2d, xyz_t, alpha_t = self._preprocess(
-            seq_init, x_t, t)
-
-        N,L = msa_masked.shape[:2]
-
-        if self.symmetry is not None:
-            idx_pdb, self.chain_idx = self.symmetry.res_idx_procesing(res_idx=idx_pdb)
-
-        msa_prev = None
-        pair_prev = None
-        state_prev = None
-
-        with torch.no_grad():
-            msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.model(msa_masked,
-                                msa_full,
-                                seq_in,
-                                xt_in,
-                                idx_pdb,
-                                t1d=t1d,
-                                t2d=t2d,
-                                xyz_t=xyz_t,
-                                alpha_t=alpha_t,
-                                msa_prev = msa_prev,
-                                pair_prev = pair_prev,
-                                state_prev = state_prev,
-                                t=torch.tensor(t),
-                                return_infer=True,
-                                motif_mask=self.diffusion_mask.squeeze().to(self.device))
-
-        # prediction of X0 
-        _, px0  = self.allatom(torch.argmax(seq_in, dim=-1), px0, alpha)
-        px0    = px0.squeeze()[:,:14]
-        
-        #####################
-        ### Get next pose ###
-        #####################
-        
-        if t > final_step:
-            seq_t_1 = nn.one_hot(seq_init,num_classes=22).to(self.device)
-            x_t_1, px0 = self.denoiser.get_next_pose(
-                xt=x_t,
-                px0=px0,
-                t=t,
-                diffusion_mask=self.mask_str.squeeze(),
-                align_motif=self.inf_conf.align_motif
-            )
-        else:
-            x_t_1 = torch.clone(px0).to(x_t.device)
-            seq_t_1 = torch.clone(seq_init)
-            px0 = px0.to(x_t.device)
-
-        if self.symmetry is not None:
-            x_t_1, seq_t_1 = self.symmetry.apply_symmetry(x_t_1, seq_t_1)
-
-        return px0, x_t_1, seq_t_1, plddt
-
 
 class SelfConditioning(Sampler):
     """
@@ -643,7 +490,10 @@ class SelfConditioning(Sampler):
     pX0[t+1] is provided as a template input to the model at time t
     """
 
-    def sample_step(self, *, t, x_t, seq_init, final_step):
+    def sample_step(self, *, t, x_t, seq_init, final_step, binderlen, 
+        hotspot_res, mask_str, sidechain_input, 
+        rf, d_t1d, con_ref_pdb_idx, hal_idx0,
+        diffusion_mask):
         '''
         Generate the next pose that the model should be supplied at timestep t-1.
         Args:
@@ -659,8 +509,10 @@ class SelfConditioning(Sampler):
         '''
 
         msa_masked, msa_full, seq_in, xt_in, idx_pdb, t1d, t2d, xyz_t, alpha_t = self._preprocess(
-            seq_init, x_t, t)
+            seq_init, x_t, t, binderlen, hotspot_res, mask_str, sidechain_input, rf, d_t1d, con_ref_pdb_idx, hal_idx0)
+
         B,N,L = xyz_t.shape[:3]
+        
 
         ##################################
         ######## Str Self Cond ###########
@@ -675,13 +527,14 @@ class SelfConditioning(Sampler):
         # No effect if t2d is only dim 44
         t2d[...,:44] = t2d_44
 
-        if self.symmetry is not None:
-            idx_pdb, self.chain_idx = self.symmetry.res_idx_procesing(res_idx=idx_pdb)
+        ## this is where to use the saved t2d.
+        ## 06/18/2025 later (Hussein)
 
         ####################
         ### Forward Pass ###
         ####################
 
+    
         with torch.no_grad():
             msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.model(msa_masked,
                                 msa_full,
@@ -697,11 +550,8 @@ class SelfConditioning(Sampler):
                                 state_prev = None,
                                 t=torch.tensor(t),
                                 return_infer=True,
-                                motif_mask=self.diffusion_mask.squeeze().to(self.device),
-                                cyclic_reses=self.cyclic_reses)   
+                                motif_mask=diffusion_mask.unsqueeze(0).to(self.device))   
 
-            if self.symmetry is not None and self.inf_conf.symmetric_self_cond:
-                px0 = self.symmetrise_prev_pred(px0=px0,seq_in=seq_in, alpha=alpha)[:,:,:3]
 
         self.prev_pred = torch.clone(px0)
 
@@ -719,8 +569,8 @@ class SelfConditioning(Sampler):
                 xt=x_t,
                 px0=px0,
                 t=t,
-                diffusion_mask=self.mask_str.squeeze(),
-                align_motif=self.inf_conf.align_motif,
+                diffusion_mask=mask_str.squeeze(),
+                align_motif=self.align_motif,
                 include_motif_sidechains=self.preprocess_conf.motif_sidechain_input
             )
             self._log.info(
@@ -729,269 +579,6 @@ class SelfConditioning(Sampler):
             x_t_1 = torch.clone(px0).to(x_t.device)
             px0 = px0.to(x_t.device)
 
-        ######################
-        ### Apply symmetry ###
-        ######################
-
-        if self.symmetry is not None:
-            x_t_1, seq_t_1 = self.symmetry.apply_symmetry(x_t_1, seq_t_1)
 
         return px0, x_t_1, seq_t_1, plddt
 
-    def symmetrise_prev_pred(self, px0, seq_in, alpha):
-        """
-        Method for symmetrising px0 output for self-conditioning
-        """
-        _,px0_aa = self.allatom(torch.argmax(seq_in, dim=-1), px0, alpha)
-        px0_sym,_ = self.symmetry.apply_symmetry(px0_aa.to('cpu').squeeze()[:,:14], torch.argmax(seq_in, dim=-1).squeeze().to('cpu'))
-        px0_sym = px0_sym[None].to(self.device)
-        return px0_sym
-
-class ScaffoldedSampler(SelfConditioning):
-    """ 
-    Model Runner for Scaffold-Constrained diffusion
-    """
-    def __init__(self, conf: DictConfig):
-        """
-        Initialize scaffolded sampler.
-        Two basic approaches here:
-            i) Given a block adjacency/secondary structure input, generate a fold (in the presence or absence of a target)
-                - This allows easy generation of binders or specific folds
-                - Allows simple expansion of an input, to sample different lengths
-            ii) Providing a contig input and corresponding block adjacency/secondary structure input
-                - This allows mixed motif scaffolding and fold-conditioning.
-                - Adjacency/secondary structure inputs must correspond exactly in length to the contig string
-        """
-        super().__init__(conf)
-        # initialize BlockAdjacency sampling class
-        if conf.scaffoldguided.scaffold_dir is None:
-            assert any(x is not None for x in (conf.contigmap.inpaint_str_helix, conf.contigmap.inpaint_str_strand, conf.contigmap.inpaint_str_loop))
-            if conf.contigmap.inpaint_str_loop is not None:
-                assert conf.scaffoldguided.mask_loops == False, "You shouldn't be masking loops if you're specifying loop secondary structure"
-        else:
-            # initialize BlockAdjacency sampling class
-            assert all(x is None for x in (conf.contigmap.inpaint_str_helix, conf.contigmap.inpaint_str_strand, conf.contigmap.inpaint_str_loop)), "can't provide scaffold_dir if you're also specifying per-residue ss"
-            self.blockadjacency = iu.BlockAdjacency(conf.scaffoldguided, conf.inference.num_designs)
-
-
-        #################################################
-        ### Initialize target, if doing binder design ###
-        #################################################
-
-        if conf.scaffoldguided.target_pdb:
-            self.target = iu.Target(conf.scaffoldguided, conf.ppi.hotspot_res)
-            self.target_pdb = self.target.get_target()
-            if conf.scaffoldguided.target_ss is not None:
-                self.target_ss = torch.load(conf.scaffoldguided.target_ss).long()
-                self.target_ss = torch.nn.functional.one_hot(self.target_ss, num_classes=4)
-                if self._conf.scaffoldguided.contig_crop is not None:
-                    self.target_ss=self.target_ss[self.target_pdb['crop_mask']]
-            if conf.scaffoldguided.target_adj is not None:
-                self.target_adj = torch.load(conf.scaffoldguided.target_adj).long()
-                self.target_adj=torch.nn.functional.one_hot(self.target_adj, num_classes=3)
-                if self._conf.scaffoldguided.contig_crop is not None:
-                        self.target_adj=self.target_adj[self.target_pdb['crop_mask']]
-                        self.target_adj=self.target_adj[:,self.target_pdb['crop_mask']]
-        else:
-            self.target = None
-            self.target_pdb=False
-
-    def sample_init(self):
-        """
-        Wrapper method for taking secondary structure + adj, and outputting xt, seq_t
-        """
-
-        ##########################
-        ### Process Fold Input ###
-        ##########################
-        if hasattr(self, 'blockadjacency'):
-            self.L, self.ss, self.adj = self.blockadjacency.get_scaffold()
-            self.adj = nn.one_hot(self.adj.long(), num_classes=3)
-        else:
-            self.L=100 # shim. Get's overwritten
-
-        ##############################
-        ### Auto-contig generation ###
-        ##############################    
-
-        if self.contig_conf.contigs is None: 
-            # process target
-            xT = torch.full((self.L, 27,3), np.nan)
-            xT = get_init_xyz(xT[None,None]).squeeze()
-            seq_T = torch.full((self.L,),21)
-            self.diffusion_mask = torch.full((self.L,),False)
-            atom_mask = torch.full((self.L,27), False)
-            self.binderlen=self.L
-
-            if self.target:
-                target_L = np.shape(self.target_pdb['xyz'])[0]
-                # xyz
-                target_xyz = torch.full((target_L, 27, 3), np.nan)
-                target_xyz[:,:14,:] = torch.from_numpy(self.target_pdb['xyz'])
-                xT = torch.cat((xT, target_xyz), dim=0)
-                # seq
-                seq_T = torch.cat((seq_T, torch.from_numpy(self.target_pdb['seq'])), dim=0)
-                # diffusion mask
-                self.diffusion_mask = torch.cat((self.diffusion_mask, torch.full((target_L,), True)),dim=0)
-                # atom mask
-                mask_27 = torch.full((target_L, 27), False)
-                mask_27[:,:14] = torch.from_numpy(self.target_pdb['mask'])
-                atom_mask = torch.cat((atom_mask, mask_27), dim=0)
-                self.L += target_L
-                # generate contigmap object
-                contig = []
-                for idx,i in enumerate(self.target_pdb['pdb_idx'][:-1]):
-                    if idx==0:
-                        start=i[1]               
-                    if i[1] + 1 != self.target_pdb['pdb_idx'][idx+1][1] or i[0] != self.target_pdb['pdb_idx'][idx+1][0]:
-                        contig.append(f'{i[0]}{start}-{i[1]}/0 ')
-                        start = self.target_pdb['pdb_idx'][idx+1][1]
-                contig.append(f"{self.target_pdb['pdb_idx'][-1][0]}{start}-{self.target_pdb['pdb_idx'][-1][1]}/0 ")
-                contig.append(f"{self.binderlen}-{self.binderlen}")
-                contig = ["".join(contig)]
-            else:
-                contig = [f"{self.binderlen}-{self.binderlen}"]
-            self.contig_map=ContigMap(self.target_pdb, contig)
-            self.mappings = self.contig_map.get_mappings()
-            self.mask_seq = self.diffusion_mask
-            self.mask_str = self.diffusion_mask
-            L_mapped=len(self.contig_map.ref)
-
-        ############################
-        ### Specific Contig mode ###
-        ############################
-
-        else:
-            # get contigmap from command line
-            assert self.target is None, "Giving a target is the wrong way of handling this is you're doing contigs and secondary structure"
-
-            # process target and reinitialise potential_manager. This is here because the 'target' is always set up to be the second chain in out inputs.
-            self.target_feats = iu.process_target(self.inf_conf.input_pdb)
-            self.contig_map = self.construct_contig(self.target_feats)
-            self.mappings = self.contig_map.get_mappings()
-            self.mask_seq = torch.from_numpy(self.contig_map.inpaint_seq)[None,:]
-            self.mask_str = torch.from_numpy(self.contig_map.inpaint_str)[None,:]
-            self.binderlen =  len(self.contig_map.inpaint)
-            self.L = len(self.contig_map.inpaint_seq)
-            target_feats = self.target_feats
-            contig_map = self.contig_map
-
-            xyz_27 = target_feats['xyz_27']
-            mask_27 = target_feats['mask_27']
-            seq_orig = target_feats['seq']
-            L_mapped = len(self.contig_map.ref)
-            seq_T=torch.full((L_mapped,),21)
-            seq_T[contig_map.hal_idx0] = seq_orig[contig_map.ref_idx0]
-            seq_T[~self.mask_seq.squeeze()] = 21
-
-            diffusion_mask = self.mask_str
-            self.diffusion_mask = diffusion_mask
-            
-            xT = torch.full((1,1,L_mapped,27,3), np.nan)
-            xT[:, :, contig_map.hal_idx0, ...] = xyz_27[contig_map.ref_idx0,...]
-            xT = get_init_xyz(xT).squeeze()
-            atom_mask = torch.full((L_mapped, 27), False)
-            atom_mask[contig_map.hal_idx0] = mask_27[contig_map.ref_idx0]
-
-            if hasattr(self.contig_map, 'ss_spec'):
-                self.adj=torch.full((L_mapped, L_mapped),2) # masked
-                self.adj=nn.one_hot(self.adj.long(), num_classes=3)
-                self.ss=iu.ss_from_contig(self.contig_map.ss_spec)
-            assert L_mapped==self.adj.shape[0]
-            
-        ####################
-        ### Get hotspots ###
-        ####################
-        self.hotspot_0idx=iu.get_idx0_hotspots(self.mappings, self.ppi_conf, self.binderlen)
-        
-        #########################
-        ### Set up potentials ###
-        #########################
-
-        self.potential_manager = PotentialManager(self.potential_conf,
-                                                  self.ppi_conf,
-                                                  self.diffuser_conf,
-                                                  self.inf_conf,
-                                                  self.hotspot_0idx,
-                                                  self.binderlen)
-
-        self.chain_idx=['A' if i < self.binderlen else 'B' for i in range(self.L)]
-
-        ########################
-        ### Handle Partial T ###
-        ########################
-
-        if self.diffuser_conf.partial_T:
-            assert self.diffuser_conf.partial_T <= self.diffuser_conf.T
-            self.t_step_input = int(self.diffuser_conf.partial_T)
-        else:
-            self.t_step_input = int(self.diffuser_conf.T)
-        t_list = np.arange(1, self.t_step_input+1)
-        seq_T=torch.nn.functional.one_hot(seq_T, num_classes=22).float()
-
-        fa_stack, xyz_true = self.diffuser.diffuse_pose(
-            xT,
-            torch.clone(seq_T),
-            atom_mask.squeeze(),
-            diffusion_mask=self.diffusion_mask.squeeze(),
-            t_list=t_list,
-            include_motif_sidechains=self.preprocess_conf.motif_sidechain_input)
-
-        #######################
-        ### Set up Denoiser ###
-        #######################
-
-        self.denoiser = self.construct_denoiser(self.L, visible=self.mask_seq.squeeze())
-
-
-        xT = torch.clone(fa_stack[-1].squeeze()[:,:14,:])
-        return xT, seq_T
-    
-    def _preprocess(self, seq, xyz_t, t):
-        msa_masked, msa_full, seq, xyz_prev, idx_pdb, t1d, t2d, xyz_t, alpha_t = super()._preprocess(seq, xyz_t, t, repack=False)
-        
-        ###################################
-        ### Add Adj/Secondary Structure ###
-        ###################################
-
-        assert self.preprocess_conf.d_t1d == 28, "The checkpoint you're using hasn't been trained with sec-struc/block adjacency features"
-        assert self.preprocess_conf.d_t2d == 47, "The checkpoint you're using hasn't been trained with sec-struc/block adjacency features"
-       
-        #####################
-        ### Handle Target ###
-        #####################
-
-        if self.target:
-            blank_ss = torch.nn.functional.one_hot(torch.full((self.L-self.binderlen,), 3), num_classes=4)
-            full_ss = torch.cat((self.ss, blank_ss), dim=0)
-            if self._conf.scaffoldguided.target_ss is not None:
-                full_ss[self.binderlen:] = self.target_ss
-        else:
-            full_ss = self.ss
-        t1d=torch.cat((t1d, full_ss[None,None].to(self.device)), dim=-1)
-
-        t1d = t1d.float()
-        
-        ###########
-        ### t2d ###
-        ###########
-
-        if self.d_t2d == 47:
-            if self.target:
-                full_adj = torch.zeros((self.L, self.L, 3))
-                full_adj[:,:,-1] = 1. #set to mask
-                full_adj[:self.binderlen, :self.binderlen] = self.adj
-                if self._conf.scaffoldguided.target_adj is not None:
-                    full_adj[self.binderlen:,self.binderlen:] = self.target_adj
-            else:
-                full_adj = self.adj
-            t2d=torch.cat((t2d, full_adj[None,None].to(self.device)),dim=-1)
-
-        ###########
-        ### idx ###
-        ###########
-
-        if self.target:
-            idx_pdb[:,self.binderlen:] += 200
-
-        return msa_masked, msa_full, seq, xyz_prev, idx_pdb, t1d, t2d, xyz_t, alpha_t

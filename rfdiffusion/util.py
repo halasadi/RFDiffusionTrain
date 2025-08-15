@@ -168,11 +168,26 @@ def get_torsions(
     )
 
     # chis
+    idx_0 = torsion_indices[seq, :, 0, None].to(xyz.device).repeat(1, 1, 1, 3)
+    idx_1 = torsion_indices[seq, :, 1, None].to(xyz.device).repeat(1, 1, 1, 3)
+    idx_2 = torsion_indices[seq, :, 2, None].to(xyz.device).repeat(1, 1, 1, 3)
+    idx_3 = torsion_indices[seq, :, 3, None].to(xyz.device).repeat(1, 1, 1, 3)
+    ti0 = torch.gather(xyz, 2, idx_0)
+    ti1 = torch.gather(xyz, 2, idx_1)
+    ti2 = torch.gather(xyz, 2, idx_2)
+    ti3 = torch.gather(xyz, 2, idx_3)
+
+    '''
     ti0 = torch.gather(xyz, 2, torsion_indices[seq, :, 0, None].repeat(1, 1, 1, 3))
     ti1 = torch.gather(xyz, 2, torsion_indices[seq, :, 1, None].repeat(1, 1, 1, 3))
     ti2 = torch.gather(xyz, 2, torsion_indices[seq, :, 2, None].repeat(1, 1, 1, 3))
     ti3 = torch.gather(xyz, 2, torsion_indices[seq, :, 3, None].repeat(1, 1, 1, 3))
+    '''
+
     torsions[:, :, 3:7, :] = th_dih(ti0, ti1, ti2, ti3)
+
+    ref_angles = ref_angles.to(xyz.device)
+
 
     # CB bend
     NC = 0.5 * (xyz[:, :, 0, :3] + xyz[:, :, 2, :3])

@@ -1,18 +1,16 @@
 # script for diffusion protocols
-import torch
-import pickle
-import numpy as np
-import os
 import logging
+import os
+import pickle
+import time
 
+import numpy as np
+import torch
 from scipy.spatial.transform import Rotation as scipy_R
 
-from rfdiffusion.util import rigid_from_3_points
-
-from rfdiffusion.util_module import ComputeAllAtomCoords
-
 from rfdiffusion import igso3
-import time
+from rfdiffusion.util import rigid_from_3_points
+from rfdiffusion.util_module import ComputeAllAtomCoords
 
 torch.set_printoptions(sci_mode=False)
 
@@ -42,7 +40,7 @@ def get_beta_schedule(T, b0, bT, schedule_type, schedule_params={}, inference=Fa
 
     if inference:
         print(
-            f"With this beta schedule ({schedule_type} schedule, beta_0 = {round(b0, 3)}, beta_T = {round(bT,3)}), alpha_bar_T = {alphabar_t_schedule[-1]}"
+            f"With this beta schedule ({schedule_type} schedule, beta_0 = {round(b0, 3)}, beta_T = {round(bT, 3)}), alpha_bar_T = {alphabar_t_schedule[-1]}"
         )
 
     return schedule, alpha_schedule, alphabar_t_schedule
@@ -67,6 +65,91 @@ class EuclideanDiffuser:
             self.alpha_schedule,
             self.alphabar_schedule,
         ) = get_beta_schedule(T, b_0, b_T, schedule_type, **schedule_kwargs)
+
+    def diffuse_translations_batched(self, xyz, diffusion_mask=None, var_scale=1):
+        """
+        Diffuse translations with batch support.
+
+        Parameters:
+            xyz (torch.tensor): (B, L, 3, 3) Backbone coordinates with batch dimension.
+            diffusion_mask (torch.tensor, optional): (B, L) Mask describing residues to diffuse. True means NOT diffused.
+            var_scale (float): Variance scaling factor.
+
+        Returns:
+            diffused_xyz (torch.tensor): (B, T, L, 3, 3) Diffused backbone coordinates over timesteps.
+            deltas (torch.tensor): (B, T, L, 3) Translations at each timestep.
+        """
+        return self.apply_kernel_recursive_batched(xyz, diffusion_mask, var_scale)
+
+    def apply_kernel_batched(self, x, t, diffusion_mask=None, var_scale=1):
+        """
+        Applies a noising kernel to the points in x with batch support.
+
+        Parameters:
+            x (torch.tensor): (B, L, 3, 3) Backbone coordinates with batch dimension.
+            t (int): Timestep index (1-indexed).
+            diffusion_mask (torch.tensor, optional): (B, L) Mask describing residues to diffuse. True means NOT diffused.
+            var_scale (float): Variance scaling factor.
+
+        Returns:
+            out_crds (torch.tensor): (B, L, 3, 3) Diffused coordinates.
+            delta (torch.tensor): (B, L, 3) Translations applied at this timestep.
+        """
+        t_idx = t - 1  # Bring from 1-indexed to 0-indexed
+
+        B, L, _, _ = x.shape  # Batch size, sequence length
+        ca_xyz = x[:, :, 1, :]  # Extract C-alpha coordinates: (B, L, 3)
+
+        b_t = self.beta_schedule[t_idx]  # Scalar value for this timestep
+
+        # Compute mean and variance
+        mean = torch.sqrt(1 - b_t) * ca_xyz  # (B, L, 3)
+        var = torch.ones(B, L, 3, device=x.device) * (b_t * var_scale)  # (B, L, 3)
+        # remove the device argument for pytorch lightning compatibility
+        # var = torch.ones(B, L, 3) * (b_t * var_scale)  # (B, L, 3)
+
+        # Sample noise and compute delta
+        sampled_crds = torch.normal(mean, torch.sqrt(var))  # (B, L, 3)
+        delta = sampled_crds - ca_xyz  # (B, L, 3)
+
+        # Apply diffusion mask
+        if diffusion_mask is not None:
+            delta[diffusion_mask, ...] = 0
+
+        # Add delta to original coordinates
+        out_crds = x + delta[:, :, None, :]  # Broadcast delta across (B, L, 3, 3)
+
+        return out_crds, delta
+
+    def apply_kernel_recursive_batched(self, xyz, diffusion_mask=None, var_scale=1):
+        """
+        Repeatedly apply self.apply_kernel T times with batch support.
+
+        Parameters:
+            xyz (torch.tensor): (B, L, 3, 3) Backbone coordinates with batch dimension.
+            diffusion_mask (torch.tensor, optional): (B, L) Mask describing residues to diffuse. True means NOT diffused.
+            var_scale (float): Variance scaling factor.
+
+        Returns:
+            bb_stack (torch.tensor): (B, T, L, 3, 3) Diffused backbone coordinates over timesteps.
+            T_stack (torch.tensor): (B, T, L, 3) Translations at each timestep.
+        """
+        B, L, _, _ = xyz.shape  # Batch size, sequence length
+
+        bb_stack = []
+        T_stack = []
+
+        cur_xyz = torch.clone(xyz)
+
+        for t in range(1, self.T + 1):
+            cur_xyz, cur_T = self.apply_kernel_batched(
+                cur_xyz, t, var_scale=var_scale, diffusion_mask=diffusion_mask
+            )
+            bb_stack.append(cur_xyz)  # Append coordinates for this timestep
+            T_stack.append(cur_T)  # Append translations for this timestep
+
+        # Stack results across timesteps and transpose for (B, T, L, ...)
+        return torch.stack(bb_stack, dim=2), torch.stack(T_stack, dim=2)
 
     def diffuse_translations(self, xyz, diffusion_mask=None, var_scale=1):
         return self.apply_kernel_recursive(xyz, diffusion_mask, var_scale)
@@ -96,10 +179,15 @@ class EuclideanDiffuser:
         mean = torch.sqrt(1 - b_t) * ca_xyz
         var = torch.ones(L, 3) * (b_t) * var_scale
 
+        ###### debugging, comment out later
+        seed_value = 42  # Choose a fixed seed value
+        torch.manual_seed(seed_value)
+        ######
+
         sampled_crds = torch.normal(mean, torch.sqrt(var))
         delta = sampled_crds - ca_xyz
 
-        if not diffusion_mask is None:
+        if diffusion_mask is not None:
             delta[diffusion_mask, ...] = 0
 
         out_crds = x + delta[:, None, :]
@@ -122,9 +210,7 @@ class EuclideanDiffuser:
             bb_stack.append(cur_xyz)
             T_stack.append(cur_T)
 
-        return torch.stack(bb_stack).transpose(0, 1), torch.stack(T_stack).transpose(
-            0, 1
-        )
+        return torch.stack(bb_stack).transpose(0, 1), torch.stack(T_stack).transpose(0, 1)
 
 
 def write_pkl(save_path: str, pkl_data):
@@ -199,7 +285,8 @@ class IGSO3:
         self.step_size = 1 / self.T
 
     def _calc_igso3_vals(self, L=2000):
-        """_calc_igso3_vals computes numerical approximations to the
+        """
+        _calc_igso3_vals computes numerical approximations to the
         relevant analytically intractable functionals of the igso3
         distribution.
 
@@ -237,7 +324,7 @@ class IGSO3:
                 num_sigma=self.num_sigma,
                 min_sigma=self.min_sigma,
                 max_sigma=self.max_sigma,
-                num_omega=self.num_omega
+                num_omega=self.num_omega,
             )
             write_pkl(cache_fname, igso3_vals)
 
@@ -263,7 +350,7 @@ class IGSO3:
         return self.sigma_idx(self.sigma(continuous_t))
 
     def sigma(self, t: torch.tensor):
-        """
+        r"""
         Extract \sigma(t) corresponding to chosen sigma schedule.
 
         Args:
@@ -278,17 +365,13 @@ class IGSO3:
             return 10**sigma
         elif self.schedule == "linear":  # Variance exploding analogue of Ho schedule
             # add self.min_sigma for stability
-            return (
-                self.min_sigma
-                + t * self.min_b
-                + (1 / 2) * (t**2) * (self.max_b - self.min_b)
-            )
+            return self.min_sigma + t * self.min_b + (1 / 2) * (t**2) * (self.max_b - self.min_b)
         else:
             raise ValueError(f"Unrecognize schedule {self.schedule}")
 
     def g(self, t):
-        """
-        g returns the drift coefficient at time t
+        r"""
+        G returns the drift coefficient at time t
 
         since
             sigma(t)^2 := \int_0^t g(s)^2 ds,
@@ -308,12 +391,13 @@ class IGSO3:
 
     def sample(self, ts, n_samples=1):
         """
-        sample uses the inverse cdf to sample an angle of rotation from
+        Sample uses the inverse cdf to sample an angle of rotation from
         IGSO(3)
 
         Args:
             ts: array of integer time steps to sample from.
             n_samples: number of samples to draw.
+
         Returns:
         sampled angles of rotation. [len(ts), N]
         """
@@ -329,8 +413,16 @@ class IGSO3:
             all_samples.append(sample_i)
         return np.stack(all_samples, axis=0)
 
+    def sample_vec_batch(self, t, B, L):
+        n_samples = B * L
+        vec = self.sample_vec(t, n_samples=n_samples)  # Shape: [T, B * L, 3]
+        vec = vec.reshape(len(t), B, L, 3)  # Reshape to [T, B, L, 3]
+        vec = vec.transpose(1, 0, 2, 3)  # Transpose to [B, T, L, 3]
+        return vec
+
     def sample_vec(self, ts, n_samples=1):
-        """sample_vec generates a rotation vector(s) from IGSO(3) at time steps
+        """
+        sample_vec generates a rotation vector(s) from IGSO(3) at time steps
         ts.
 
         Return:
@@ -346,6 +438,7 @@ class IGSO3:
         Args:
             t: integer time step
             omega: angles (scalar or shape [N])
+
         Return:
             score_norm with same shape as omega
         """
@@ -358,7 +451,8 @@ class IGSO3:
         return score_norm_t
 
     def score_vec(self, ts, vec):
-        """score_vec computes the score of the IGSO(3) density as a rotation
+        """
+        score_vec computes the score of the IGSO(3) density as a rotation
         vector. This score vector is in the direction of the sampled vector,
         and has magnitude given by score_norms.
 
@@ -369,6 +463,7 @@ class IGSO3:
         Args:
             ts: times of shape [T]
             vec: where to compute the score of shape [T, N, 3]
+
         Returns:
             score vectors of shape [T, N, 3]
         """
@@ -388,14 +483,91 @@ class IGSO3:
         return score_norm * vec / omega[..., None]
 
     def exp_score_norm(self, ts):
-        """exp_score_norm returns the expected value of norm of the score for
+        """
+        exp_score_norm returns the expected value of norm of the score for
         IGSO(3) with time parameter ts of shape [T].
         """
         sigma_idcs = [self.t_to_idx(t) for t in ts]
         return self.igso3_vals["exp_score_norms"][sigma_idcs]
 
+    def diffuse_frames_batched(self, xyz, t_list, diffusion_mask=None):
+        """
+        diffuse_frames samples from the IGSO(3) distribution to noise frames, now supporting a batch dimension.
+
+        Args:
+            xyz (np.array or torch.tensor): [B, L, 3, 3] set of backbone coordinates for each batch.
+            t_list (list of int): List of time steps (one-indexed). Shape: [B, T].
+            diffusion_mask (np.array or torch.tensor): Optional. [B, L] boolean mask. True/1 is NOT diffused, False/0 IS diffused.
+
+        Returns:
+            Tuple:
+            - perturbed_crds: [B, L, T, 3, 3] (noised N/CA/C coordinates for each residue).
+            - R_perturbed: [B, L, T, 3, 3] (rotation matrices for perturbed frames).
+
+            Both are numpy arrays.
+        """
+        if torch.is_tensor(xyz):
+            if xyz.dtype == torch.bfloat16:
+                # Convert to float32 for numpy conversion
+                xyz = xyz.to(torch.float32).cpu().numpy()
+            else:
+                xyz = xyz.cpu().numpy()
+
+        B, L = xyz.shape[:2]  # Batch size and number of residues
+
+        # Extract N, Ca, C from input xyz
+        N = torch.from_numpy(xyz[:, :, 0, :])  # [B, L, 3]
+        Ca = torch.from_numpy(xyz[:, :, 1, :])  # [B, L, 3]
+        C = torch.from_numpy(xyz[:, :, 2, :])  # [B, L, 3]
+
+        R_true, Ca = rigid_from_3_points(N, Ca, C)  # R_true: [B, L, 3, 3], Ca: [B, L, 3]
+
+        # Batchify time steps into [B, T] for `sample_vec`
+        t = np.arange(self.T) + 1  # 1-indexed!!
+
+        # Sample rotation vectors and apply mask (if provided)
+        sampled_rots = self.sample_vec_batch(t, B, L)
+        if diffusion_mask is not None:
+            non_diffusion_mask = 1 - diffusion_mask[:, :, None]  # [B, L, 1]
+            sampled_rots = sampled_rots * non_diffusion_mask[:, None, :, :]  # [B, T, L, 3]
+
+        # Convert sampled rotation vectors into rotation matrices
+        R_sampled = (
+            scipy_R.from_rotvec(sampled_rots.reshape(-1, 3))
+            .as_matrix()
+            .reshape(B, self.T, L, 3, 3)
+        )  # [B, T, L, 3, 3]
+
+        # Apply sampled rotation to R_true
+        R_perturbed = np.einsum("btlij,bljk->btlik", R_sampled, R_true)  # [B, T, L, 3, 3]
+
+        # Apply sampled rotation to xyz (perturb coordinates)
+        perturbed_crds = (
+            np.einsum(
+                "btlij,blaj->btlai",  # Adjust subscripts to match shapes
+                R_sampled,  # [B, T, L, 3, 3]
+                xyz[:, :, :3, :] - Ca[:, :, None, ...].numpy(),  # [B, T, L, 3]
+            )
+            + Ca[:, None, :, None].numpy()
+        )
+
+        if t_list is not None:
+            # Adjust for 1-indexed t_list and make it batch-friendly
+            idx = np.array([i - 1 for i in t_list])  # [L] -> Adjust for zero-indexed
+            perturbed_crds = perturbed_crds[
+                :, idx, :, :
+            ]  # Select the indices along the time axis for each batch
+            R_perturbed = R_perturbed[:, idx, :, :]  # Same for R_perturbed
+
+        # Transpose the perturbed_crds and R_perturbed for desired output
+        perturbed_crds = np.transpose(perturbed_crds, (0, 2, 1, 3, 4))
+        R_perturbed = np.transpose(R_perturbed, (0, 2, 1, 3, 4))
+
+        return perturbed_crds, R_perturbed
+
     def diffuse_frames(self, xyz, t_list, diffusion_mask=None):
-        """diffuse_frames samples from the IGSO(3) distribution to noise frames
+        """
+        diffuse_frames samples from the IGSO(3) distribution to noise frames
 
         Parameters:
             xyz (np.array or torch.tensor, required): (L,3,3) set of backbone coordinates
@@ -404,7 +576,6 @@ class IGSO3:
             np.array : N/CA/C coordinates for each residue
                         (T,L,3,3), where T is num timesteps
         """
-
         if torch.is_tensor(xyz):
             xyz = xyz.numpy()
 
@@ -435,9 +606,7 @@ class IGSO3:
         )
         R_perturbed = np.einsum("tnij,njk->tnik", R_sampled, R_true)
         perturbed_crds = (
-            np.einsum(
-                "tnij,naj->tnai", R_sampled, xyz[:, :3, :] - Ca[:, None, ...].numpy()
-            )
+            np.einsum("tnij,naj->tnai", R_sampled, xyz[:, :3, :] - Ca[:, None, ...].numpy())
             + Ca[None, :, None].numpy()
         )
 
@@ -451,10 +620,9 @@ class IGSO3:
             R_perturbed.transpose(1, 0, 2, 3),
         )
 
-    def reverse_sample_vectorized(
-        self, R_t, R_0, t, noise_level, mask=None, return_perturb=False
-    ):
-        """reverse_sample uses an approximation to the IGSO3 score to sample
+    def reverse_sample_vectorized(self, R_t, R_0, t, noise_level, mask=None, return_perturb=False):
+        """
+        reverse_sample uses an approximation to the IGSO3 score to sample
         a rotation at the previous time step.
 
         Roughly - this update follows the reverse time SDE for Reimannian
@@ -473,6 +641,7 @@ class IGSO3:
         B't are Brownian motions. The formula for g(t) obtains from equation 9
         of [2], from which this sampling function may be generalized to
         alternative noising schedules.
+
         Args:
             R_t: noisy rotation of shape [N, 3, 3]
             R_0: prediction of un-noised rotation
@@ -483,6 +652,7 @@ class IGSO3:
             mask: whether the residue is to be updated.  A value of 1 means the
                 rotation is not updated from r_t.  A value of 0 means the
                 rotation is updated.
+
         Return:
             sampled rotation matrix for time t-1 of shape [3, 3]
         Reference:
@@ -497,6 +667,7 @@ class IGSO3:
         R_0, R_t = torch.tensor(R_0), torch.tensor(R_t)
         R_0t = torch.einsum("...ij,...kj->...ik", R_t, R_0)
         R_0t_rotvec = torch.tensor(
+            # scipy_R.from_matrix(R_0t.cpu().numpy()).as_rotvec()
             scipy_R.from_matrix(R_0t.cpu().numpy()).as_rotvec()
         ).to(R_0.device)
 
@@ -597,6 +768,110 @@ class Diffuser:
 
         print("Successful diffuser __init__")
 
+    def diffuse_pose_batched(
+        self,
+        xyz,  # (B, L, 14/27, 3)
+        seq,  # (B, L)
+        atom_mask,  # (B, L, 14/27)
+        include_motif_sidechains=True,
+        diffusion_mask=None,  # (B, L)
+        t_list=None,
+    ):
+        """
+        Given full atom xyz, sequence and atom mask, diffuse the protein frame
+        translations and rotations, supporting batch inputs.
+
+        Parameters:
+            xyz (torch.tensor): (B, L, 14/27, 3) set of coordinates
+            seq (torch.tensor): (B, L) integer sequence
+            atom_mask (torch.tensor): (B, L, 14/27) mask describing presence/absence of an atom
+            diffusion_mask (torch.tensor, optional): (B, L) Tensor of bools; True means NOT diffused, False means diffused
+            t_list (list, optional): If present, only return the diffused coordinates at timesteps t within the list
+        """
+        B, L, _, _ = xyz.shape  # Batch size, sequence length, atoms, coords
+
+        if diffusion_mask is None:
+            diffusion_mask = torch.zeros((B, L), dtype=torch.bool)
+
+        get_allatom = ComputeAllAtomCoords().to(device=xyz.device)
+
+        # Bring to origin and scale
+        # Check if any BB atoms are NaN before centering
+        # nan_mask = ~torch.isnan(xyz[:, :, :3, :]).any(dim=-1).any(dim=-1)  # (B, L)
+        # assert torch.sum(~nan_mask) == 0, "NaN values found in backbone atoms"
+
+        # Center unmasked structure at origin to prevent information leak
+        # if torch.sum(diffusion_mask) != 0:
+        #    self.motif_com = xyz[diffusion_mask].view(B, -1, 3).mean(dim=1, keepdim=True)
+        #    xyz = xyz - self.motif_com.unsqueeze(1)
+        # else:
+        #    xyz = xyz - xyz[:, :, 1, :].mean(dim=1, keepdim=True)
+
+        xyz_true = torch.clone(xyz)
+        xyz = xyz * self.crd_scale
+
+        # 1. Get translations
+        tick = time.time()
+        # both diffused_T and deltas are torch tensors
+        diffused_T, deltas = self.eucl_diffuser.diffuse_translations_batched(
+            xyz[:, :, :3, :].clone(), diffusion_mask=diffusion_mask
+        )
+        diffused_T /= self.crd_scale
+        deltas /= self.crd_scale
+
+        # 2. Get frames
+        tick = time.time()
+        # both diffused_frame_crds and diffused_frames are numpy arrays
+        diffused_frame_crds, diffused_frames = self.so3_diffuser.diffuse_frames_batched(
+            xyz[:, :, :3, :].clone(), diffusion_mask=diffusion_mask.cpu().numpy(), t_list=None
+        )
+        diffused_frame_crds /= self.crd_scale
+
+        # Combine all the diffused quantities to make full atom diffused poses
+        tick = time.time()
+
+        cum_delta = deltas.cumsum(dim=2)
+
+        # move to GPU
+        diffused_BB = (
+            torch.from_numpy(diffused_frame_crds).to(cum_delta.device)
+            + cum_delta[:, :, :, None, :]
+        ).permute(0, 2, 1, 3, 4)  # [T, B, L, 3, 3]
+
+        B, t_steps, L = diffused_BB.shape[:3]
+        diffused_fa = torch.zeros(B, t_steps, L, 27, 3).to(xyz_true.device)
+        diffused_fa[:, :, :, :3, :] = diffused_BB
+
+        assert xyz_true.device == diffusion_mask.device, (
+            "xyz_true and diffusion_mask are on different devices!"
+        )
+        assert cum_delta.device == diffused_fa.device, (
+            "cum_delta and diffused_fa are on different devices!"
+        )
+        assert diffused_fa.device == diffusion_mask.device, (
+            "diffused_fa and diffusion_mask are on different devices!"
+        )
+
+        # Add in sidechains from motif
+        if include_motif_sidechains:
+            # Expand diffusion_mask to match dimensions for broadcasting
+            mask = diffusion_mask[:, None, :, None, None]  # Shape: [B, 1, L, 1, 1]
+
+            # Update only the first 14 atoms in diffused_fa for positions where diffusion_mask is True
+            diffused_fa[:, :, :, :14, :] = torch.where(
+                mask,  # Condition: Apply only where diffusion_mask is True
+                xyz_true[:, None, :, :14, :],  # Use xyz_true values
+                diffused_fa[:, :, :, :14, :],  # Keep existing diffused_fa values
+            )
+
+        if t_list is None:
+            fa_stack = diffused_fa
+        else:
+            t_idx_list = [t - 1 for t in t_list]
+            fa_stack = diffused_fa[:, t_idx_list, :, :, :]
+
+        return fa_stack, xyz_true
+
     def diffuse_pose(
         self,
         xyz,
@@ -624,7 +899,6 @@ class Diffuser:
 
 
         """
-
         if diffusion_mask is None:
             diffusion_mask = torch.zeros(len(xyz.squeeze())).to(dtype=bool)
 
@@ -633,17 +907,20 @@ class Diffuser:
 
         # bring to origin and scale
         # check if any BB atoms are nan before centering
-        nan_mask = ~torch.isnan(xyz.squeeze()[:, :3]).any(dim=-1).any(dim=-1)
-        assert torch.sum(~nan_mask) == 0
+
+        # nan_mask = ~torch.isnan(xyz.squeeze()[:, :3]).any(dim=-1).any(dim=-1)
+        # assert torch.sum(~nan_mask) == 0
 
         # Centre unmasked structure at origin, as in training (to prevent information leak)
-        if torch.sum(diffusion_mask) != 0:
-            self.motif_com = xyz[diffusion_mask, 1, :].mean(
-                dim=0
-            )  # This is needed for one of the potentials
-            xyz = xyz - self.motif_com
-        elif torch.sum(diffusion_mask) == 0:
-            xyz = xyz - xyz[:, 1, :].mean(dim=0)
+
+        # 1/15/25 I do this as a pre-processing step so no need to do it again
+        # if torch.sum(diffusion_mask) != 0:
+        #    self.motif_com = xyz[diffusion_mask, 1, :].mean(
+        #        dim=0
+        #    )  # This is needed for one of the potentials
+        #    xyz = xyz - self.motif_com
+        # elif torch.sum(diffusion_mask) == 0:
+        #    xyz = xyz - xyz[:, 1, :].mean(dim=0)
 
         xyz_true = torch.clone(xyz)
         xyz = xyz * self.crd_scale
@@ -669,9 +946,7 @@ class Diffuser:
         tick = time.time()
         cum_delta = deltas.cumsum(dim=1)
         # The coordinates of the translated AND rotated frames
-        diffused_BB = (
-            torch.from_numpy(diffused_frame_crds) + cum_delta[:, :, None, :]
-        ).transpose(
+        diffused_BB = (torch.from_numpy(diffused_frame_crds) + cum_delta[:, :, None, :]).transpose(
             0, 1
         )  # [n,L,3,3]
         # diffused_BB  = torch.from_numpy(diffused_frame_crds).transpose(0,1)
