@@ -216,4 +216,3 @@ line-ending = "auto"              # Like Black, automatically detect the appropr
 docstring-code-format = true
 
 
-"""
