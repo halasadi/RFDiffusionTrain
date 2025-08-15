@@ -27,9 +27,11 @@ Used this protocol to fine-tune RFDiffusion for TCR-pMHC complex generation. Sho
 
 ## Key Implementation Notes
 
-**L2D Loss:** The supplement has inconsistencies in the binning strategy, so I followed the original RosettaFold2 repo implementation instead.
+**Losses:** There are two major losses in RFDiffusion: dFrame and L2D. Followed the supplementary section in coming the dFrame Loss. While for the L2D loss, the supplement seemed to be in-consistent in binning strategy compared to the code (see PARAMS variable), so I followed the original RosettaFold2 repo implementation instead.
 
-**Generalized Templates:** I removed TCR/peptide/MHC specific parts and created generalized templates. You'll need to adapt them for your protein system.
+**Generalized Templates:** I removed TCR/peptide/MHC specific parts and sketched out generalized code for dataloaders that I have not tested. You'll need to adapt them for your protein system.
+
+**Compute Enviornment** You will need to adapt the code to suit your compute enviornment, i.e. GPU/Data/Pixi enviornment.
 
 ## Files
 
