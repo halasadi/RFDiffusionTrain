@@ -29,7 +29,7 @@ Used this protocol to fine-tune RFDiffusion for TCR-pMHC complex generation. Sho
 
 **Losses:** RFDiffusion employs two primary loss functions: dFrame and L2D. The dFrame loss was implemented following the methodology described in the supplementary materials. For the L2D loss, inconsistencies were found between the binning strategy outlined in the supplement and the actual code implementation (specifically in the PARAMS variable). To resolve this discrepancy, I opted to follow the implementation from the original RosettaFold2 repository, though this choice may introduce potential inaccuracies given the conflicting documentation.
 
-**Generalized Templates:** I removed TCR/peptide/MHC specific parts and sketched out generalized code for dataloaders that I have not tested. You'll need to adapt them for your protein system.
+**Generalized Templates:** I removed TCR/peptide/MHC specific parts and sketched out generalized code for `dataset.py`, `train_rfdiffusion.py`, `test_diffusion.py` that I have not tested. You'll need to adapt them for your protein system.
 
 **Compute Enviornment** This implementation will not build out of the box and requires adaptation to your specific computing environment.
 
